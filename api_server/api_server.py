@@ -1,5 +1,7 @@
 import logging
 import json
+import os
+import time
 from typing import Optional
 from contextlib import asynccontextmanager
 
@@ -9,12 +11,13 @@ from kafka.errors import KafkaError
 from google.cloud import storage
 
 # ----- 설정 -----
-GCS_KEY_PATH        = "/home/joon/keys/vocabulary-459105-5603cb550881.json"
+GCS_KEY_PATH        = os.environ.get("GCS_KEY_PATH")
 BUCKET_NAME         = "wh04-voc"
-NON_ARS_JSON_DIR    = "tmp/raw/consulting/"
-ARS_JSON_DIR        = "tmp/raw/ars/consulting/"
-AUDIO_DIR           = "tmp/raw/ars/audio/"
+NON_ARS_JSON_DIR    = "new/raw/consulting/"
+ARS_JSON_DIR        = "new/raw/ars/consulting/"
+AUDIO_DIR           = "new/raw/ars/audio/"
 
+BOOTSTRAP_SERVER    = "kafka:9093"
 TOPIC               = "voc-consulting-raw"
 MAX_RETRIES         = 3
 RETRY_BACKOFF_MS    = 500
@@ -49,7 +52,7 @@ async def lifespan(app: FastAPI):
         try:
             # Kafka Producer
             producer = KafkaProducer(
-                bootstrap_servers="kafka:9093",
+                bootstrap_servers=BOOTSTRAP_SERVER,
                 acks="all",
                 enable_idempotence=True,
                 retries=MAX_RETRIES,

@@ -23,6 +23,10 @@ services:
   api1:
     build:
       context: ./api_server
+    volumes:
+      - /home/joon/keys:/keys
+    env_file:
+      - .env
     environment:
       - APP_PORT=8888
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9093
@@ -41,6 +45,10 @@ services:
   api2:
     build:
       context: ./api_server
+    volumes:
+      - /home/joon/keys:/keys
+    env_file:
+      - .env
     environment:
       - APP_PORT=8889
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9093
