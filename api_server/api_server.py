@@ -15,8 +15,7 @@ NON_ARS_JSON_DIR    = "tmp/raw/consulting/"
 ARS_JSON_DIR        = "tmp/raw/ars/consulting/"
 AUDIO_DIR           = "tmp/raw/ars/audio/"
 
-KAFKA_BOOTSTRAP     = "34.47.117.122:9092"
-TOPIC               = "voc-audio-raw"
+TOPIC               = "voc-consulting-raw"
 MAX_RETRIES         = 3
 RETRY_BACKOFF_MS    = 500
 
@@ -46,15 +45,26 @@ async def lifespan(app: FastAPI):
     global producer, storage_client, bucket
     logger.info("Kafka Producer 준비 완료…")
     
-    # Kafka Producer
-    producer = KafkaProducer(
-        bootstrap_servers=KAFKA_BOOTSTRAP,
-        acks="all",
-        enable_idempotence=True,
-        retries=MAX_RETRIES,
-        retry_backoff_ms=RETRY_BACKOFF_MS,
-        value_serializer=lambda v: json.dumps(v).encode("utf-8"),
-    )
+    for attempt in range(10):
+        try:
+            # Kafka Producer
+            producer = KafkaProducer(
+                bootstrap_servers="kafka:9093",
+                acks="all",
+                enable_idempotence=True,
+                retries=MAX_RETRIES,
+                retry_backoff_ms=RETRY_BACKOFF_MS,
+                value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+            )
+            logger.info("Kafka 연결 성공!")
+            break
+        except NoBrokersAvailable as e:
+            logger.warning(f"[{attempt+1}/10] Kafka 연결 실패, 2초 후 재시도..")
+            time.sleep(2)
+    else:
+        logger.error("Kafka 연결 실패. 종료되지 않지만 연결은 실패 상태.")
+        producer = None
+
     # GCS Client
     storage_client = storage.Client.from_service_account_json(GCS_KEY_PATH)
     bucket = storage_client.bucket(BUCKET_NAME)
