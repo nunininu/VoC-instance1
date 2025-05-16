@@ -64,25 +64,6 @@ services:
           memory: 512m  # AWS t2.large -> 768m
           cpus: "0.5"
 
-  stt:
-    build:
-      context: ./stt_server
-    volumes:
-      - /home/joon/keys:/keys
-    env_file:
-      - .env
-    ports:
-      - "8001:8001"
-    depends_on:
-      - kafka
-    networks:
-      - kafka-network
-    deploy:
-      resources:
-        limits:
-          memory: 512m  # AWS t2.large -> 768m
-          cpus: "0.5"
-
   kafka:
     image: bitnami/kafka:3.6
     ports:
