@@ -64,20 +64,6 @@ services:
           memory: 512m  # AWS t2.large -> 768m
           cpus: "0.5"
 
-  #stt:
-  #  build:
-  #    context: ./stt_server
-  #  command: uvicorn stt_server:app --host 0.0.0.0 --port 8001
-  #  ports:
-  #    - "8001:8001"
-  #  depends_on:
-  #    - kafka
-  #  deploy:
-  #    resources:
-  #      limits:
-  #        memory: 512m  # AWS t2.large -> 768m
-  #        cpus: "0.5"
-
   kafka:
     image: bitnami/kafka:3.6
     ports:
