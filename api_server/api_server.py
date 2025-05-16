@@ -58,7 +58,7 @@ async def lifespan(app: FastAPI):
             )
             logger.info("Kafka 연결 성공!")
             break
-        except NoBrokersAvailable as e:
+        except:
             logger.warning(f"[{attempt+1}/10] Kafka 연결 실패, 2초 후 재시도..")
             time.sleep(2)
     else:
