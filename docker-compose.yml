@@ -70,12 +70,11 @@ services:
     build:
       context: ./api_server
     volumes:
-      - /home/joon/keys:/keys
+      - ./api_server:/app
     env_file:
       - .env
     environment:
       - APP_PORT=8888
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9093
     ports:
       - "8888:8888"
     depends_on:
@@ -93,12 +92,11 @@ services:
     build:
       context: ./api_server
     volumes:
-      - /home/joon/keys:/keys
+      - ./api_server:/app
     env_file:
       - .env
     environment:
       - APP_PORT=8889
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9093
     ports:
       - "8889:8889"
     depends_on:
