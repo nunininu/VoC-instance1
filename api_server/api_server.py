@@ -9,7 +9,8 @@ from contextlib import asynccontextmanager
 import asyncpg
 from fastapi import FastAPI, File, Response, HTTPException
 from aiokafka import AIOKafkaProducer
-from kafka.errors import KafkaError
+from kafka.admin import KafkaAdminClient, NewTopic
+from kafka.errors import KafkaError, TopicAlreadyExistsError
 
 # ----- 설정 -----
 DB_HOST = os.environ.get("DB_HOST")
@@ -33,67 +34,52 @@ logging.basicConfig(
 )
 logger = logging.getLogger("submit_service")
 
-
-# ----- Life cycle -----
-@asynccontextmanager
-async def lifespan(app: FastAPI):
+# ----- Kafka 유틸 함수 -----
+def create_kafka_topic():
     """
-    FastAPI Lifecycle 관리 함수
-    yield 이전 코드는 서버 시작 직후 실행되고,
-    yield 이후 코드는 서버 종료 직후 실행된다.
+    Kafka 토픽을 생성하는 함수
+    """
+    admin_client = KafkaAdminClient(
+        bootstrap_servers=BOOTSTRAP_SERVER,
+        client_id="api-server"
+    )
+
+    try:
+        admin_client.create_topics(
+            new_topics=[
+                NewTopic(
+                    name=TOPIC,
+                    num_partitions=3,
+                    replication_factor=1
+                )
+            ],
+            validate_only=False
+        )
+        logger.info(f"토픽 생성 완료: {TOPIC}")
+    except TopicAlreadyExistsError:
+        logger.warning(f"이미 존재하는 토픽: {TOPIC}")
+    finally:
+        admin_client.close()
+
+async def safe_send_kafka(msg: dict):
+    """
+    Kafka Broker로 메시지를 전송하는 함수
 
     Args:
-        app (FastAPI): 실행 시킬 FastAPI 앱
+        msg (dict): 문의 정보가 담긴 데이터
     """
-    global db_pool, producer
-    logger.info("DB & Kafka 연결중..")
-    
-    # DB
-    db_pool = await asyncpg.create_pool(
-        host=DB_HOST,
-        port=DB_PORT,
-        user=DB_USER,
-        password=DB_PASSWORD,
-        database=DB
-    )
-    logger.info("DB 연결 성공!")
-
-    # Kafka Producer
-    for attempt in range(40):
+    for attempt in range(MAX_RETRIES):
         try:
-            producer = AIOKafkaProducer(
-                bootstrap_servers=BOOTSTRAP_SERVER,
-                acks="all",
-                enable_idempotence=True,
-                value_serializer=lambda v: json.dumps(v).encode("utf-8"),
-            )
-            await producer.start()
-            logger.info("Kafka 연결 성공!")
-            break
-        except Exception as e:
-            logger.warning(f"[{attempt+1}/40] Kafka 연결 실패, 5초 후 재시도..")
-            logger.error(e)
-            await asyncio.sleep(5)
-    else:
-        logger.error("Kafka 연결 실패. 종료되지 않지만 연결은 실패 상태.")
-        producer = None
-    
-    yield
-    
-    logger.info("서버를 종료합니다…")
-    try:
-        await producer.flush()
-    except Exception as e:
-        logger.warning(f"요청 전송 중 에러 발생: {e}")
-    finally:
-        await producer.stop()
-        await db_pool.close()
+            metadata = await producer.send_and_wait(TOPIC, msg)
+            logger.info(f"메시지 전송 완료. {metadata.topic}[{metadata.partition}]@{metadata.offset}")
+            return
+        except KafkaError as e:
+            logger.warning(f"[{attempt + 1}/{MAX_RETRIES}] Kafka 전송 실패: {e}")
+            await asyncio.sleep(1)
+            raise HTTPException(status_code=500, detail="메시지 전송 실패")
+    raise KafkaError("Kafka 전송 재시도 실패")
 
-
-app = FastAPI(lifespan=lifespan)
-
-
-# ----- 유틸 함수 -----
+# ----- DB 유틸 함수 -----
 async def execute_query_with_rollback(
         query: str,
         kafka_msg: dict,
@@ -117,23 +103,67 @@ async def execute_query_with_rollback(
         logger.error(f"쿼리 또는 Kafka 전송 실패로 롤백: {e}")
         raise
 
-async def safe_send_kafka(msg: dict):
+# ----- Life cycle -----
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     """
-    Kafka Broker로 메시지를 전송하는 함수
+    FastAPI Lifecycle 관리 함수
+    yield 이전 코드는 서버 시작 직후 실행되고,
+    yield 이후 코드는 서버 종료 직후 실행된다.
 
     Args:
-        msg (dict): 문의 정보가 담긴 데이터
+        app (FastAPI): 실행 시킬 FastAPI 앱
     """
-    for attempt in range(MAX_RETRIES):
+    global db_pool, producer
+    logger.info("DB & Kafka 연결중..")
+
+    # DB
+    db_pool = await asyncpg.create_pool(
+        host=DB_HOST,
+        port=DB_PORT,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        database=DB
+    )
+    logger.info("DB 연결 성공!")
+    
+    # Kafka Topic
+    create_kafka_topic()
+
+    # Kafka Producer
+    for attempt in range(40):
         try:
-            metadata = await producer.send_and_wait(TOPIC, msg)
-            logger.info(f"메시지 전송 완료. {metadata.topic}[{metadata.partition}]@{metadata.offset}")
-            return
-        except KafkaError as e:
-            logger.warning(f"[{attempt + 1}/{MAX_RETRIES}] Kafka 전송 실패: {e}")
-            await asyncio.sleep(1)
-            raise HTTPException(status_code=500, detail="메시지 전송 실패")
-    raise KafkaError("Kafka 전송 재시도 실패")
+            producer = AIOKafkaProducer(
+                bootstrap_servers=BOOTSTRAP_SERVER,
+                acks="all",
+                enable_idempotence=True,
+                value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+            )
+            await producer.start()
+            logger.info("Kafka 연결 성공!")
+            break
+        except Exception as e:
+            logger.warning(f"[{attempt+1}/40] Kafka 연결 실패, 5초 후 재시도..")
+            logger.error(e)
+            await asyncio.sleep(5)
+    else:
+        logger.error("Kafka 연결 실패. 종료되지 않지만 연결은 실패 상태.")
+        producer = None
+
+    yield
+
+    logger.info("서버를 종료합니다…")
+    try:
+        await producer.flush()
+    except Exception as e:
+        logger.warning(f"요청 전송 중 에러 발생: {e}")
+    finally:
+        await producer.stop()
+        await db_pool.close()
+
+
+# ----- FastAPI 객체 생성 -----
+app = FastAPI(lifespan=lifespan)
 
 
 # ----- 엔드포인트 -----
@@ -166,10 +196,10 @@ async def submit_data(json_file: bytes = File(...)) -> Response:
             payload["turns"],
             payload["content"]
         )
-        
+
         await execute_query_with_rollback(insert_sql, payload, data)
         logger.info("문의 데이터 저장 성공")
-        
+
         return Response(status_code=204)
     except Exception as e:
         logger.exception(f"문의 데이터 저장 중 에러 발생: {e}")
