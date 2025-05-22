@@ -2,6 +2,7 @@ import asyncio
 import logging
 import json
 import os
+from datetime import datetime
 from typing import Optional, Tuple
 from contextlib import asynccontextmanager
 
@@ -20,7 +21,6 @@ DB = os.environ.get("DB")
 BOOTSTRAP_SERVER    = "kafka:9093"
 TOPIC               = "voc-consulting-raw"
 MAX_RETRIES         = 3
-RETRY_BACKOFF_MS    = 500
 
 # ------ 공통 클라이언트 -----
 db_pool: asyncpg.pool.Pool
@@ -59,22 +59,21 @@ async def lifespan(app: FastAPI):
     logger.info("DB 연결 성공!")
 
     # Kafka Producer
-    for attempt in range(10):
+    for attempt in range(40):
         try:
             producer = AIOKafkaProducer(
                 bootstrap_servers=BOOTSTRAP_SERVER,
                 acks="all",
                 enable_idempotence=True,
-                retries=MAX_RETRIES,
-                retry_backoff_ms=RETRY_BACKOFF_MS,
                 value_serializer=lambda v: json.dumps(v).encode("utf-8"),
             )
             await producer.start()
             logger.info("Kafka 연결 성공!")
             break
-        except:
-            logger.warning(f"[{attempt+1}/10] Kafka 연결 실패, 2초 후 재시도..")
-            await asyncio.sleep(2)
+        except Exception as e:
+            logger.warning(f"[{attempt+1}/40] Kafka 연결 실패, 5초 후 재시도..")
+            logger.error(e)
+            await asyncio.sleep(5)
     else:
         logger.error("Kafka 연결 실패. 종료되지 않지만 연결은 실패 상태.")
         producer = None
@@ -83,7 +82,7 @@ async def lifespan(app: FastAPI):
     
     logger.info("서버를 종료합니다…")
     try:
-        await producer.flush(timeout=10)
+        await producer.flush()
     except Exception as e:
         logger.warning(f"요청 전송 중 에러 발생: {e}")
     finally:
@@ -95,7 +94,10 @@ app = FastAPI(lifespan=lifespan)
 
 
 # ----- 유틸 함수 -----
-async def execute_query_with_rollback(query: str, kafka_msg: dict, data: Optional[Tuple] = None):
+async def execute_query_with_rollback(
+        query: str,
+        kafka_msg: dict,
+        data: Optional[Tuple] = None):
     """
     DB 쿼리를 실행하는 함수
 
@@ -106,11 +108,13 @@ async def execute_query_with_rollback(query: str, kafka_msg: dict, data: Optiona
     """
     try:
         async with db_pool.acquire() as conn:
-            await conn.fetch(query, *data) if data else conn.fetch(query)
-            await safe_send_kafka(kafka_msg)
-        logger.info("쿼리 + Kafka 전송 성공!")
+            async with conn.transaction():
+                await conn.execute(query, *data) if data else conn.execute(query)
+                logger.info("쿼리 실행 성공!")
+                await safe_send_kafka(kafka_msg)
+                logger.info("Kafka 전송 성공!")
     except Exception as e:
-        logger.error(f"쿼리 또는 Kafka 전송 실패: {e}")
+        logger.error(f"쿼리 또는 Kafka 전송 실패로 롤백: {e}")
         raise
 
 async def safe_send_kafka(msg: dict):
@@ -158,15 +162,15 @@ async def submit_data(json_file: bytes = File(...)) -> Response:
             payload["client_id"],
             payload["category_id"],
             payload["channel_id"],
-            payload["consulting_datetime"],
+            datetime.strptime(payload["consulting_datetime"], "%Y-%m-%d %H:%M:%S"),
             payload["turns"],
             payload["content"]
         )
         
-        await execute_query_with_rollback(insert_sql, payload,data)
+        await execute_query_with_rollback(insert_sql, payload, data)
         logger.info("문의 데이터 저장 성공")
         
         return Response(status_code=204)
-    except Exception:
-        logger.exception("문의 데이터 저장 중 에러 발생. DB 롤백")
+    except Exception as e:
+        logger.exception(f"문의 데이터 저장 중 에러 발생: {e}")
         raise HTTPException(status_code=500, detail="처리 실패")
