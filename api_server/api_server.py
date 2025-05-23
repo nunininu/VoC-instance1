@@ -234,11 +234,11 @@ async def get_consultings(
     문의 내역 전체 최신순으로 가져온 후 반환
 
     Args:
-      page (int): 페이지
-      limit (int): 페이지 당 문의 수
+        page (int): 페이지
+        limit (int): 페이지 당 문의 수
     
     Returns:
-      (List[dict]): 문의 내역 리스트
+        (List[dict]): 문의 내역 리스트
     """
     offset = (page - 1) * limit
     query = """
@@ -257,3 +257,34 @@ async def get_consultings(
 
     result = await fetch_query(query, (limit, offset))
     return result
+
+@app.get("/consulting/{consulting_id}")
+async def get_consulting_detail(consulting_id: str) -> dict:
+    """
+    문의 내역 상세 반환
+
+    Args:
+        consulting_id (str): 문의 고유 ID
+
+    Returns:
+        (dict): 문의 상세 내역
+    """
+    query = """
+    SELECT
+        cl.client_id,
+        cl.client_name,
+        ca.category_name,
+        co.consulting_datetime,
+        co.content
+        -- ar.keywords
+        -- ar.positive
+        -- ar.negative
+    FROM consulting as co
+    JOIN client as cl ON co.client_id = cl.client_id
+    JOIN category as ca ON co.category_id = ca.category_id
+    -- JOIN analysis_result as ar on co.consulting_id = ar.consulting_id
+    WHERE consulting_id = $1
+    """
+
+    result = await fetch_query(query, (consulting_id, ))
+    return result[0] if result else {}
