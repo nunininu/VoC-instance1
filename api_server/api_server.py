@@ -3,12 +3,11 @@ import logging
 import json
 import os
 from datetime import datetime
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 from contextlib import asynccontextmanager
 
 import asyncpg
-from fastapi import FastAPI, File, Response, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, File, Response, HTTPException, Query
 from aiokafka import AIOKafkaProducer
 from kafka.admin import KafkaAdminClient, NewTopic
 from kafka.errors import KafkaError, TopicAlreadyExistsError
@@ -96,7 +95,8 @@ async def fetch_query(
         list[dict]: 결과 rows
     """
     async with db_pool.acquire() as conn:
-        rows = await conn.fetch
+        rows = await conn.fetch(query, *data) if data else await conn.fetch(query)
+        return [dict(row) for row in rows]
 
 async def execute_query_with_rollback(
         query: str,
@@ -224,3 +224,36 @@ async def submit_data(json_file: bytes = File(...)) -> Response:
     except Exception as e:
         logger.exception(f"문의 데이터 저장 중 에러 발생: {e}")
         raise HTTPException(status_code=500, detail="처리 실패")
+
+@app.get("/consultings")
+async def get_consultings(
+    page: int = Query(1, gt=0),
+    limit: int = Query(20, gt=0)
+) -> List[dict]:
+    """
+    문의 내역 전체 최신순으로 가져온 후 반환
+
+    Args:
+      page (int): 페이지
+      limit (int): 페이지 당 문의 수
+    
+    Returns:
+      (List[dict]): 문의 내역 리스트
+    """
+    offset = (page - 1) * limit
+    query = """
+    SELECT
+        co.consulting_id,
+        cl.client_name,
+        cl.client_id,
+        ca.category_name,
+        co.consulting_datetime
+    FROM consulting as co
+    JOIN client as cl ON co.client_id = cl.client_id
+    JOIN category as ca ON co.category_id = ca.category_id
+    ORDER BY co.consulting_datetime DESC
+    LIMIT $1 OFFSET $2
+    """
+
+    result = await fetch_query(query, (limit, offset))
+    return result
