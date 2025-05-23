@@ -308,3 +308,51 @@ async def get_client_with_name(client_name: str) -> List[dict]:
 
     result = await fetch_query(query, (client_name, ))
     return result
+
+@app.get("/client/{client_id}")
+async def get_client_detail_with_id(
+    client_id: str,
+    page: int = Query(1, gt=0),
+    limit: int = Query(20, gt=0)
+) -> dict:
+    """
+    입력 또는 이름 검색에서 선택한 고객 ID로 고객 상세 내역 반환
+
+    Args:
+        client_id (str): 고객 고유 ID
+        page (int): 고객 최근 문의 내역 페이지
+        limit (int): 페이지 당 고객 최근 문의 내역
+
+    Returns:
+        (dict): 고객 상세 내역
+    """
+    offset = (page - 1) * limit
+    query_client = """
+    SELECT
+        client_id,
+        client_name,
+        signup_datetime,
+        is_terminated
+    FROM client
+    WHERE client_id = $1
+    """
+    result = await fetch_query(query_client, (client_id, ))
+    if not result:
+        raise HTTPException(status_code=404, detail="고객을 찾을 수 없습니다.")
+    client = result[0]
+
+    query_consultings = """
+    SELECT
+        co.consulting_id,
+        ca.category_name,
+        co.consulting_datetime
+    FROM consulting as co
+    JOIN category as ca ON co.category_id = ca.category_id
+    WHERE co.client_id = $1
+    ORDER BY co.consulting_datetime DESC
+    LIMIT $2 OFFSET $3
+    """
+    consultings = await fetch_query(query_consultings, (client_id, limit, offset))
+
+    client["consultings"] = consultings
+    return client
