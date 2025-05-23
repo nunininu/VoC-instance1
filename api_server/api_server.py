@@ -288,3 +288,23 @@ async def get_consulting_detail(consulting_id: str) -> dict:
 
     result = await fetch_query(query, (consulting_id, ))
     return result[0] if result else {}
+
+@app.get("/client/{client_name}")
+async def get_client_with_name(client_name: str) -> List[dict]:
+    """
+    입력한 이름과 동일한 고객 리스트 반환
+
+    Args:
+        client_name (str): 고객 이름
+
+    Returns:
+        (List[dict]): 동명이인 고객 리스트
+    """
+    query = """
+    SELECT *
+    FROM client
+    WHERE client_name = $1
+    """
+
+    result = await fetch_query(query, (client_name, ))
+    return result
