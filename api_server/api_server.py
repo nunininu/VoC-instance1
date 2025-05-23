@@ -1,26 +1,32 @@
+import asyncio
 import logging
 import json
 import os
-import time
-from typing import Optional
+from datetime import datetime
+from typing import Optional, Tuple
 from contextlib import asynccontextmanager
 
+import asyncpg
 from fastapi import FastAPI, File, Response, HTTPException
-from kafka import KafkaProducer
-from kafka.errors import KafkaError
-from google.cloud import storage
+from fastapi.responses import JSONResponse
+from aiokafka import AIOKafkaProducer
+from kafka.admin import KafkaAdminClient, NewTopic
+from kafka.errors import KafkaError, TopicAlreadyExistsError
 
 # ----- 설정 -----
-GCS_KEY_PATH        = os.environ.get("GCS_KEY_PATH")
-BUCKET_NAME         = "wh04-voc"
-NON_ARS_JSON_DIR    = "new/raw/consulting/"
-ARS_JSON_DIR        = "new/raw/ars/consulting/"
-AUDIO_DIR           = "new/raw/ars/audio/"
+DB_HOST = os.environ.get("DB_HOST")
+DB_PORT = os.environ.get("DB_PORT")
+DB_USER = os.environ.get("DB_USER")
+DB_PASSWORD = os.environ.get("DB_PASSWORD")
+DB = os.environ.get("DB")
 
 BOOTSTRAP_SERVER    = "kafka:9093"
 TOPIC               = "voc-consulting-raw"
 MAX_RETRIES         = 3
-RETRY_BACKOFF_MS    = 500
+
+# ------ 공통 클라이언트 -----
+db_pool: asyncpg.pool.Pool
+producer: AIOKafkaProducer
 
 # ----- 로깅 -----
 logging.basicConfig(
@@ -29,149 +35,192 @@ logging.basicConfig(
 )
 logger = logging.getLogger("submit_service")
 
-# ------ 공통 클라이언트 -----
-producer: KafkaProducer
-storage_client: storage.Client
-bucket: storage.Bucket
+# ----- Kafka 유틸 함수 -----
+def create_kafka_topic():
+    """
+    Kafka 토픽 생성
+    """
+    admin_client = KafkaAdminClient(
+        bootstrap_servers=BOOTSTRAP_SERVER,
+        client_id="api-server"
+    )
 
+    try:
+        admin_client.create_topics(
+            new_topics=[
+                NewTopic(
+                    name=TOPIC,
+                    num_partitions=3,
+                    replication_factor=2
+                )
+            ],
+            validate_only=False
+        )
+        logger.info(f"토픽 생성 완료: {TOPIC}")
+    except TopicAlreadyExistsError:
+        logger.warning(f"이미 존재하는 토픽: {TOPIC}")
+    finally:
+        admin_client.close()
+
+async def safe_send_kafka(msg: dict):
+    """
+    Kafka Broker로 메시지 전송
+
+    Args:
+        msg (dict): 문의 정보가 담긴 데이터
+    """
+    for attempt in range(MAX_RETRIES):
+        try:
+            metadata = await producer.send_and_wait(TOPIC, msg)
+            logger.info(f"메시지 전송 완료. {metadata.topic}[{metadata.partition}]@{metadata.offset}")
+            return
+        except KafkaError as e:
+            logger.warning(f"[{attempt + 1}/{MAX_RETRIES}] Kafka 전송 실패: {e}")
+            await asyncio.sleep(1)
+            raise HTTPException(status_code=500, detail="메시지 전송 실패")
+    raise KafkaError("Kafka 전송 재시도 실패")
+
+# ----- DB 유틸 함수 -----
+async def fetch_query(
+    query: str,
+    data: Optional[Tuple] = None
+) -> list[dict]:
+    """
+    SELECT 쿼리 결과를 JSON serializable 형태로 반환
+
+    Args:
+        query (str): SELECT 쿼리
+        data (Optional[Tuple]): 파라미터 값. 기본은 None
+
+    Returns:
+        list[dict]: 결과 rows
+    """
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch
+
+async def execute_query_with_rollback(
+        query: str,
+        kafka_msg: dict = None,
+        data: Optional[Tuple] = None):
+    """
+    INSERT, DELETE, UPDATE 쿼리 실행
+
+    Args:
+        query (str): SQL 쿼리문
+        kafka_msg (dict): Kafka Broker에 전달할 메시지
+        data (Optional[Tuple]): 쿼리에 필요한 데이터 (기본 값은 None)
+    """
+    try:
+        async with db_pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(query, *data) if data else conn.execute(query)
+                logger.info("쿼리 실행 성공!")
+                
+                if kafka_msg:
+                    await safe_send_kafka(kafka_msg)
+                    logger.info("Kafka 전송 성공!")
+    except Exception as e:
+        logger.error(f"쿼리 또는 Kafka 전송 실패로 롤백: {e}")
+        raise
 
 # ----- Life cycle -----
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    FastAPI Lifecycle 관리 함수  
-    yield 이전 코드는 서버 시작 직후 실행되고,
+    FastAPI Lifecycle 관리
+    yield 이전 코드는 서버 시작 직후 실행되고,  
     yield 이후 코드는 서버 종료 직후 실행된다.
-    
-    :param app: 실행 시킬 FastAPI 앱
+
+    Args:
+        app (FastAPI): 실행 시킬 FastAPI 앱
     """
-    global producer, storage_client, bucket
-    logger.info("Kafka Producer 준비 완료…")
+    global db_pool, producer
+    logger.info("DB & Kafka 연결중..")
+
+    # DB
+    db_pool = await asyncpg.create_pool(
+        host=DB_HOST,
+        port=DB_PORT,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        database=DB
+    )
+    logger.info("DB 연결 성공!")
     
-    for attempt in range(10):
+    # Kafka Topic
+    create_kafka_topic()
+
+    # Kafka Producer
+    for attempt in range(40):
         try:
-            # Kafka Producer
-            producer = KafkaProducer(
+            producer = AIOKafkaProducer(
                 bootstrap_servers=BOOTSTRAP_SERVER,
                 acks="all",
                 enable_idempotence=True,
-                retries=MAX_RETRIES,
-                retry_backoff_ms=RETRY_BACKOFF_MS,
                 value_serializer=lambda v: json.dumps(v).encode("utf-8"),
             )
+            await producer.start()
             logger.info("Kafka 연결 성공!")
             break
-        except:
-            logger.warning(f"[{attempt+1}/10] Kafka 연결 실패, 2초 후 재시도..")
-            time.sleep(2)
+        except Exception as e:
+            logger.warning(f"[{attempt+1}/40] Kafka 연결 실패, 5초 후 재시도..")
+            logger.error(e)
+            await asyncio.sleep(5)
     else:
         logger.error("Kafka 연결 실패. 종료되지 않지만 연결은 실패 상태.")
         producer = None
 
-    # GCS Client
-    storage_client = storage.Client.from_service_account_json(GCS_KEY_PATH)
-    bucket = storage_client.bucket(BUCKET_NAME)
     yield
-    logger.info("Kafka Producer를 종료합니다…")
+
+    logger.info("서버를 종료합니다…")
     try:
-        producer.flush(timeout=10)
+        await producer.flush()
     except Exception as e:
         logger.warning(f"요청 전송 중 에러 발생: {e}")
-    producer.close()
+    finally:
+        await producer.stop()
+        await db_pool.close()
 
 
+# ----- FastAPI 객체 생성 -----
 app = FastAPI(lifespan=lifespan)
-
-
-# ----- 유틸 함수 -----
-def upload_json(path: str, data: json) -> None:
-    """
-    json 파일 업로드 함수
-    
-    :param path: 업로드할 경로  
-    :param data: 업로드할 json 데이터
-    """
-    blob = bucket.blob(path)
-    blob.upload_from_string(
-        json.dumps(data, ensure_ascii=False),
-        content_type="application/json"
-    )
-    logger.info(f"JSON 파일 업로드 완료. gs://{BUCKET_NAME}/{path}")
-
-
-def upload_audio(path: str, data: bytes) -> None:
-    """
-    음성 파일 업로드 함수
-    
-    :param path: 업로드할 경로  
-    :param data: 업로드할 음성 데이터
-    """
-    blob = bucket.blob(path)
-    blob.upload_from_string(
-        data,
-        content_type="audio/mpeg"
-    )
-    logger.info(f"음성 파일 업로드 완료. gs://{BUCKET_NAME}/{path}")
-
-
-def send_message(msg: dict) -> None:
-    """
-    Kafka Broker로 메시지를 전송하는 함수
-    
-    :param msg: 전송할 메시지
-    """
-    future = producer.send(TOPIC, msg)
-    logger.info(f"Kafka 메시지 전송중...")
-    try:
-        metadata = future.get(timeout=5)
-        logger.info(f"메시지 전송 완료. {metadata.topic}[{metadata.partition}]@{metadata.offset}")
-    except KafkaError as e:
-        logger.error(f"메시지 전송 실패: {e}")
-        raise HTTPException(status_code=500, detail="메시지 전송 실패")
 
 
 # ----- 엔드포인트 -----
 @app.post("/submit")
-async def submit_data(
-    json_file: bytes = File(...),
-    audio_file: Optional[bytes] = File(None)
-) -> Response:
+async def submit_data(json_file: bytes = File(...)) -> Response:
     """
-    API 요청을 받아 Kafka Producer로 데이터를 전송하는 함수
-    
-    :param json_file: 문의 정보가 담긴 json 파일  
-    :param audio_file: 문의 음성 데이터
-    
-    :return: 요청 결과
+    문의 데이터를 받아 DB 저장 및 Kakfa 메시지 전송
+
+    Args:
+        json_file (bytes): 문의 정보가 담긴 json 파일
+
+    Returns:
+        (Response): 요청 결과
     """
     try:
         payload = json.loads(json_file.decode("utf-8"))
-        has_audio = audio_file is not None
-        logger.info(f"데이터 수신 완료 (audio={'yes' if has_audio else 'no'}), payload keys={list(payload.keys())}")
+        logger.info(f"데이터 수신 완료. payload keys={list(payload.keys())}")
 
-        dt = payload.get("consulting_date").replace("-","")
-        consulting_id = payload.get("consulting_id")
-        
-        json_name = f"{dt}_consulting_{consulting_id}"
-        json_path = f"{ARS_JSON_DIR if has_audio else NON_ARS_JSON_DIR}{json_name}.json"
-        upload_json(json_path, payload)
-        
-        # 음섬 파일이 존재하는 경우(ARS)
-        # 존재하지 않는 경우는 바로 위 코드로 json 파일이 업로드됨
-        if has_audio:
-            audio_name = f"{dt}_audio_{consulting_id}"
-            audio_path = f"{AUDIO_DIR}{audio_name}.mp3"
-            
-            upload_audio(audio_path, audio_file)
-            
-            msg = {"dt": dt, "consulting_id": consulting_id}
-            send_message(msg)
-            
-        # 응답
+        # DB 저장
+        insert_sql = """
+        INSERT INTO consulting (consulting_id, client_id, category_id, channel_id, consulting_datetime, turns, content)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        """
+        data = (
+            payload["consulting_id"],
+            payload["client_id"],
+            payload["category_id"],
+            payload["channel_id"],
+            datetime.strptime(payload["consulting_datetime"], "%Y-%m-%dT%H:%M:%S"),
+            payload["turns"],
+            payload["content"]
+        )
+
+        await execute_query_with_rollback(insert_sql, payload, data)
+        logger.info("문의 데이터 저장 성공")
+
         return Response(status_code=204)
-    except HTTPException:
-        raise
-    except Exception:
-        logger.exception("데이터 전송 중 에러 발생.")
-        raise HTTPException(status_code=500, detail="서버 에러 발생")
-
+    except Exception as e:
+        logger.exception(f"문의 데이터 저장 중 에러 발생: {e}")
+        raise HTTPException(status_code=500, detail="처리 실패")

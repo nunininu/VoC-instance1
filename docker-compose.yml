@@ -3,6 +3,52 @@ networks:
     driver: bridge
 
 services:
+  zookeeper:
+    image: bitnami/zookeeper:latest
+    ports:
+      - "2181:2181"
+    environment:
+      - ALLOW_ANONYMOUS_LOGIN=yes
+    networks:
+      - kafka-network
+    deploy:
+      resources:
+        limits:
+          memory: 256m  # AWS t2.large -> 512m
+          cpus: "0.2"
+
+  kafka:
+    image: bitnami/kafka:3.6
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    environment:
+      - KAFKA_BROKER_ID=1
+      - KAFKA_CFG_KRAFT_MODE=false
+      - KAFKA_CFG_ZOOKEEPER_CONNECT=zookeeper:2181
+      - KAFKA_CFG_LISTENERS=INTERNAL://0.0.0.0:9093,EXTERNAL://0.0.0.0:9092
+      - KAFKA_CFG_ADVERTISED_LISTENERS=INTERNAL://kafka:9093,EXTERNAL://34.47.117.122:9092
+      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      - KAFKA_CFG_INTER_BROKER_LISTENER_NAME=INTERNAL
+    depends_on:
+      - zookeeper
+    networks:
+      - kafka-network
+    healthcheck:
+      test: [
+        "CMD-SHELL",
+        "/opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9093 --list || exit 1"
+      ]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 1g    # AWS t2.large -> 1.5g
+          cpus: "0.3"
+
   nginx:
     image: nginx:latest
     ports:
@@ -24,16 +70,16 @@ services:
     build:
       context: ./api_server
     volumes:
-      - /home/joon/keys:/keys
+      - ./api_server:/app
     env_file:
       - .env
     environment:
       - APP_PORT=8888
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9093
     ports:
       - "8888:8888"
     depends_on:
-      - kafka
+      kafka:
+        condition: service_healthy
     networks:
       - kafka-network
     deploy:
@@ -46,16 +92,16 @@ services:
     build:
       context: ./api_server
     volumes:
-      - /home/joon/keys:/keys
+      - ./api_server:/app
     env_file:
       - .env
     environment:
       - APP_PORT=8889
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9093
     ports:
       - "8889:8889"
     depends_on:
-      - kafka
+      kafka:
+        condition: service_healthy
     networks:
       - kafka-network
     deploy:
@@ -63,40 +109,3 @@ services:
         limits:
           memory: 512m  # AWS t2.large -> 768m
           cpus: "0.5"
-
-  kafka:
-    image: bitnami/kafka:3.6
-    ports:
-      - "9092:9092"
-      - "9093:9093"
-    environment:
-      - KAFKA_BROKER_ID=1
-      - KAFKA_CFG_KRAFT_MODE=false
-      - KAFKA_CFG_ZOOKEEPER_CONNECT=zookeeper:2181
-      - KAFKA_CFG_LISTENERS=INTERNAL://0.0.0.0:9093,EXTERNAL://0.0.0.0:9092
-      - KAFKA_CFG_ADVERTISED_LISTENERS=INTERNAL://kafka:9093,EXTERNAL://34.47.117.122:9092
-      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
-      - KAFKA_CFG_INTER_BROKER_LISTENER_NAME=INTERNAL
-    depends_on:
-      - zookeeper
-    networks:
-      - kafka-network
-    deploy:
-      resources:
-        limits:
-          memory: 1g    # AWS t2.large -> 1.5g
-          cpus: "0.3"
-
-  zookeeper:
-    image: bitnami/zookeeper:latest
-    ports:
-      - "2181:2181"
-    environment:
-      - ALLOW_ANONYMOUS_LOGIN=yes
-    networks:
-      - kafka-network
-    deploy:
-      resources:
-        limits:
-          memory: 256m  # AWS t2.large -> 512m
-          cpus: "0.2"
