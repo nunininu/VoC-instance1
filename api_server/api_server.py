@@ -13,12 +13,13 @@ from kafka.admin import KafkaAdminClient, NewTopic
 from kafka.errors import KafkaError, TopicAlreadyExistsError
 
 # ----- 설정 -----
-DB_HOST = os.environ.get("DB_HOST")
-DB_PORT = os.environ.get("DB_PORT")
-DB_USER = os.environ.get("DB_USER")
-DB_PASSWORD = os.environ.get("DB_PASSWORD")
-DB = os.environ.get("DB")
-
+DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB = (
+    os.environ.get("DB_HOST"),
+    os.environ.get("DB_PORT"),
+    os.environ.get("DB_USER"),
+    os.environ.get("DB_PASSWORD"),
+    os.environ.get("DB")
+)
 BOOTSTRAP_SERVER    = "kafka:9093"
 TOPIC               = "voc-consulting-raw"
 MAX_RETRIES         = 3
@@ -39,33 +40,25 @@ def create_kafka_topic():
     """
     Kafka 토픽 생성
     """
-    admin_client = KafkaAdminClient(
-        bootstrap_servers=BOOTSTRAP_SERVER,
-        client_id="api-server"
-    )
-
     try:
-        admin_client.create_topics(
-            new_topics=[
-                NewTopic(
-                    name=TOPIC,
-                    num_partitions=3,
-                    replication_factor=2
-                )
-            ],
-            validate_only=False
+        admin = KafkaAdminClient(
+            bootstrap_servers=BOOTSTRAP_SERVER,
+            client_id="api-server"
+        )
+        admin.create_topics(
+            [NewTopic(name=TOPIC, num_partitions=3, replication_factor=1)]
         )
         logger.info(f"토픽 생성 완료: {TOPIC}")
     except TopicAlreadyExistsError:
         logger.warning(f"이미 존재하는 토픽: {TOPIC}")
     finally:
-        admin_client.close()
+        admin.close()
 
 async def safe_send_kafka(msg: dict):
     """
     Kafka Broker로 메시지 전송
 
-    Args:
+    Args:  
         msg (dict): 문의 정보가 담긴 데이터
     """
     for attempt in range(MAX_RETRIES):
@@ -76,8 +69,7 @@ async def safe_send_kafka(msg: dict):
         except KafkaError as e:
             logger.warning(f"[{attempt + 1}/{MAX_RETRIES}] Kafka 전송 실패: {e}")
             await asyncio.sleep(1)
-            raise HTTPException(status_code=500, detail="메시지 전송 실패")
-    raise KafkaError("Kafka 전송 재시도 실패")
+    raise HTTPException(status_code=500, detail="메시지 전송 실패")
 
 # ----- DB 유틸 함수 -----
 async def fetch_query(
@@ -87,11 +79,11 @@ async def fetch_query(
     """
     SELECT 쿼리 결과를 JSON serializable 형태로 반환
 
-    Args:
-        query (str): SELECT 쿼리
+    Args:  
+        query (str): SELECT 쿼리  
         data (Optional[Tuple]): 파라미터 값. 기본은 None
 
-    Returns:
+    Returns:  
         list[dict]: 결과 rows
     """
     async with db_pool.acquire() as conn:
@@ -105,9 +97,9 @@ async def execute_query_with_rollback(
     """
     INSERT, DELETE, UPDATE 쿼리 실행
 
-    Args:
-        query (str): SQL 쿼리문
-        kafka_msg (dict): Kafka Broker에 전달할 메시지
+    Args:  
+        query (str): SQL 쿼리문  
+        kafka_msg (dict): Kafka Broker에 전달할 메시지  
         data (Optional[Tuple]): 쿼리에 필요한 데이터 (기본 값은 None)
     """
     try:
@@ -115,29 +107,20 @@ async def execute_query_with_rollback(
             async with conn.transaction():
                 await conn.execute(query, *data) if data else conn.execute(query)
                 logger.info("쿼리 실행 성공!")
-                
+
                 if kafka_msg:
                     await safe_send_kafka(kafka_msg)
                     logger.info("Kafka 전송 성공!")
     except Exception as e:
-        logger.error(f"쿼리 또는 Kafka 전송 실패로 롤백: {e}")
+        logger.error(f"DB/Kafka 처리 실패: {e}")
         raise
 
 # ----- Life cycle -----
-@asynccontextmanager
-async def lifespan(app: FastAPI):
+async def init_database():
     """
-    FastAPI Lifecycle 관리
-    yield 이전 코드는 서버 시작 직후 실행되고,  
-    yield 이후 코드는 서버 종료 직후 실행된다.
-
-    Args:
-        app (FastAPI): 실행 시킬 FastAPI 앱
+    데이터베이스 초기화 및 연결
     """
-    global db_pool, producer
-    logger.info("DB & Kafka 연결중..")
-
-    # DB
+    global db_pool
     db_pool = await asyncpg.create_pool(
         host=DB_HOST,
         port=DB_PORT,
@@ -147,11 +130,14 @@ async def lifespan(app: FastAPI):
     )
     logger.info("DB 연결 성공!")
     
-    # Kafka Topic
-    create_kafka_topic()
-
-    # Kafka Producer
-    for attempt in range(40):
+async def init_kafka_producer():
+    """
+    Kafka Producer 생성
+    """
+    global producer
+    retries = 20
+    
+    for attempt in range(retries):
         try:
             producer = AIOKafkaProducer(
                 bootstrap_servers=BOOTSTRAP_SERVER,
@@ -163,15 +149,17 @@ async def lifespan(app: FastAPI):
             logger.info("Kafka 연결 성공!")
             break
         except Exception as e:
-            logger.warning(f"[{attempt+1}/40] Kafka 연결 실패, 5초 후 재시도..")
+            logger.warning(f"[{attempt+1}/{retries}] Kafka 연결 실패, 5초 후 재시도..")
             logger.error(e)
             await asyncio.sleep(5)
     else:
         logger.error("Kafka 연결 실패. 종료되지 않지만 연결은 실패 상태.")
         producer = None
-
-    yield
-
+        
+async def close_server():
+    """
+    서버 종료 시 실행
+    """
     logger.info("서버를 종료합니다…")
     try:
         await producer.flush()
@@ -180,6 +168,24 @@ async def lifespan(app: FastAPI):
     finally:
         await producer.stop()
         await db_pool.close()
+    
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    FastAPI Lifecycle 관리  
+    yield 이전 코드는 서버 시작 직후 실행되고,  
+    yield 이후 코드는 서버 종료 직후 실행된다.
+
+    Args:  
+        app (FastAPI): 실행 시킬 FastAPI 앱
+    """
+    await init_database()
+    await init_kafka_producer()
+    create_kafka_topic()
+
+    yield
+
+    await close_server()
 
 
 # ----- FastAPI 객체 생성 -----
@@ -192,10 +198,10 @@ async def submit_data(json_file: bytes = File(...)) -> Response:
     """
     문의 데이터를 받아 DB 저장 및 Kakfa 메시지 전송
 
-    Args:
+    Args:  
         json_file (bytes): 문의 정보가 담긴 json 파일
 
-    Returns:
+    Returns:  
         (Response): 요청 결과
     """
     try:
@@ -208,18 +214,12 @@ async def submit_data(json_file: bytes = File(...)) -> Response:
         VALUES ($1, $2, $3, $4, $5, $6, $7)
         """
         data = (
-            payload["consulting_id"],
-            payload["client_id"],
-            payload["category_id"],
-            payload["channel_id"],
-            datetime.strptime(payload["consulting_datetime"], "%Y-%m-%dT%H:%M:%S"),
-            payload["turns"],
-            payload["content"]
+            payload["consulting_id"], payload["client_id"], payload["category_id"],
+            payload["channel_id"], datetime.strptime(payload["consulting_datetime"], "%Y-%m-%dT%H:%M:%S"),
+            payload["turns"], payload["content"]
         )
-
         await execute_query_with_rollback(insert_sql, payload, data)
         logger.info("문의 데이터 저장 성공")
-
         return Response(status_code=204)
     except Exception as e:
         logger.exception(f"문의 데이터 저장 중 에러 발생: {e}")
@@ -233,59 +233,43 @@ async def get_consultings(
     """
     문의 내역 전체 최신순으로 가져온 후 반환
 
-    Args:
-        page (int): 페이지
+    Args:  
+        page (int): 페이지  
         limit (int): 페이지 당 문의 수
-    
-    Returns:
+
+    Returns:  
         (List[dict]): 문의 내역 리스트
     """
     offset = (page - 1) * limit
     query = """
-    SELECT
-        co.consulting_id,
-        cl.client_name,
-        cl.client_id,
-        ca.category_name,
-        co.consulting_datetime
+    SELECT co.consulting_id, cl.client_name, cl.client_id, ca.category_name, co.consulting_datetime
     FROM consulting as co
     JOIN client as cl ON co.client_id = cl.client_id
     JOIN category as ca ON co.category_id = ca.category_id
     ORDER BY co.consulting_datetime DESC
     LIMIT $1 OFFSET $2
     """
-
-    result = await fetch_query(query, (limit, offset))
-    return result
+    return await fetch_query(query, (limit, offset))
 
 @app.get("/consulting/{consulting_id}")
 async def get_consulting_detail(consulting_id: str) -> dict:
     """
     문의 내역 상세 반환
 
-    Args:
+    Args:  
         consulting_id (str): 문의 고유 ID
 
-    Returns:
+    Returns:  
         (dict): 문의 상세 내역
     """
     query = """
-    SELECT
-        cl.client_id,
-        cl.client_name,
-        ca.category_name,
-        co.consulting_datetime,
-        co.content
-        -- ar.keywords
-        -- ar.positive
-        -- ar.negative
+    SELECT cl.client_id, cl.client_name, ca.category_name, co.consulting_datetime, co.content -- ar.keywords, ar.positive, ar.negative
     FROM consulting as co
     JOIN client as cl ON co.client_id = cl.client_id
     JOIN category as ca ON co.category_id = ca.category_id
     -- JOIN analysis_result as ar on co.consulting_id = ar.consulting_id
     WHERE consulting_id = $1
     """
-
     result = await fetch_query(query, (consulting_id, ))
     return result[0] if result else {}
 
@@ -294,20 +278,14 @@ async def get_client_with_name(client_name: str) -> List[dict]:
     """
     입력한 이름과 동일한 고객 리스트 반환
 
-    Args:
+    Args:  
         client_name (str): 고객 이름
 
-    Returns:
+    Returns:  
         (List[dict]): 동명이인 고객 리스트
     """
-    query = """
-    SELECT *
-    FROM client
-    WHERE client_name = $1
-    """
-
-    result = await fetch_query(query, (client_name, ))
-    return result
+    query = "SELECT * FROM client WHERE client_name = $1"
+    return await fetch_query(query, (client_name, ))
 
 @app.get("/client/{client_id}")
 async def get_client_detail_with_id(
@@ -318,34 +296,26 @@ async def get_client_detail_with_id(
     """
     입력 또는 이름 검색에서 선택한 고객 ID로 고객 상세 내역 반환
 
-    Args:
-        client_id (str): 고객 고유 ID
-        page (int): 고객 최근 문의 내역 페이지
+    Args:  
+        client_id (str): 고객 고유 ID  
+        page (int): 고객 최근 문의 내역 페이지  
         limit (int): 페이지 당 고객 최근 문의 내역
 
-    Returns:
+    Returns:  
         (dict): 고객 상세 내역
     """
     offset = (page - 1) * limit
     query_client = """
-    SELECT
-        client_id,
-        client_name,
-        signup_datetime,
-        is_terminated
+    SELECT client_id, client_name, signup_datetime, is_terminated
     FROM client
     WHERE client_id = $1
     """
-    result = await fetch_query(query_client, (client_id, ))
-    if not result:
+    client_result = await fetch_query(query_client, (client_id, ))
+    if not client_result:
         raise HTTPException(status_code=404, detail="고객을 찾을 수 없습니다.")
-    client = result[0]
 
     query_consultings = """
-    SELECT
-        co.consulting_id,
-        ca.category_name,
-        co.consulting_datetime
+    SELECT co.consulting_id, ca.category_name, co.consulting_datetime
     FROM consulting as co
     JOIN category as ca ON co.category_id = ca.category_id
     WHERE co.client_id = $1
@@ -353,6 +323,6 @@ async def get_client_detail_with_id(
     LIMIT $2 OFFSET $3
     """
     consultings = await fetch_query(query_consultings, (client_id, limit, offset))
-
+    client = client_result[0]
     client["consultings"] = consultings
     return client
