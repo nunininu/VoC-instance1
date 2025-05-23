@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 
 import asyncpg
 from fastapi import FastAPI, File, Response, HTTPException
+from fastapi.responses import JSONResponse
 from aiokafka import AIOKafkaProducer
 from kafka.admin import KafkaAdminClient, NewTopic
 from kafka.errors import KafkaError, TopicAlreadyExistsError
@@ -37,7 +38,7 @@ logger = logging.getLogger("submit_service")
 # ----- Kafka 유틸 함수 -----
 def create_kafka_topic():
     """
-    Kafka 토픽을 생성하는 함수
+    Kafka 토픽 생성
     """
     admin_client = KafkaAdminClient(
         bootstrap_servers=BOOTSTRAP_SERVER,
@@ -50,7 +51,7 @@ def create_kafka_topic():
                 NewTopic(
                     name=TOPIC,
                     num_partitions=3,
-                    replication_factor=1
+                    replication_factor=2
                 )
             ],
             validate_only=False
@@ -63,7 +64,7 @@ def create_kafka_topic():
 
 async def safe_send_kafka(msg: dict):
     """
-    Kafka Broker로 메시지를 전송하는 함수
+    Kafka Broker로 메시지 전송
 
     Args:
         msg (dict): 문의 정보가 담긴 데이터
@@ -80,12 +81,29 @@ async def safe_send_kafka(msg: dict):
     raise KafkaError("Kafka 전송 재시도 실패")
 
 # ----- DB 유틸 함수 -----
+async def fetch_query(
+    query: str,
+    data: Optional[Tuple] = None
+) -> list[dict]:
+    """
+    SELECT 쿼리 결과를 JSON serializable 형태로 반환
+
+    Args:
+        query (str): SELECT 쿼리
+        data (Optional[Tuple]): 파라미터 값. 기본은 None
+
+    Returns:
+        list[dict]: 결과 rows
+    """
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch
+
 async def execute_query_with_rollback(
         query: str,
-        kafka_msg: dict,
+        kafka_msg: dict = None,
         data: Optional[Tuple] = None):
     """
-    DB 쿼리를 실행하는 함수
+    INSERT, DELETE, UPDATE 쿼리 실행
 
     Args:
         query (str): SQL 쿼리문
@@ -97,8 +115,10 @@ async def execute_query_with_rollback(
             async with conn.transaction():
                 await conn.execute(query, *data) if data else conn.execute(query)
                 logger.info("쿼리 실행 성공!")
-                await safe_send_kafka(kafka_msg)
-                logger.info("Kafka 전송 성공!")
+                
+                if kafka_msg:
+                    await safe_send_kafka(kafka_msg)
+                    logger.info("Kafka 전송 성공!")
     except Exception as e:
         logger.error(f"쿼리 또는 Kafka 전송 실패로 롤백: {e}")
         raise
@@ -107,8 +127,8 @@ async def execute_query_with_rollback(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    FastAPI Lifecycle 관리 함수
-    yield 이전 코드는 서버 시작 직후 실행되고,
+    FastAPI Lifecycle 관리
+    yield 이전 코드는 서버 시작 직후 실행되고,  
     yield 이후 코드는 서버 종료 직후 실행된다.
 
     Args:
@@ -170,7 +190,7 @@ app = FastAPI(lifespan=lifespan)
 @app.post("/submit")
 async def submit_data(json_file: bytes = File(...)) -> Response:
     """
-    문의 데이터를 받아서 처리하는 함수
+    문의 데이터를 받아 DB 저장 및 Kakfa 메시지 전송
 
     Args:
         json_file (bytes): 문의 정보가 담긴 json 파일
@@ -192,7 +212,7 @@ async def submit_data(json_file: bytes = File(...)) -> Response:
             payload["client_id"],
             payload["category_id"],
             payload["channel_id"],
-            datetime.strptime(payload["consulting_datetime"], "%Y-%m-%d %H:%M:%S"),
+            datetime.strptime(payload["consulting_datetime"], "%Y-%m-%dT%H:%M:%S"),
             payload["turns"],
             payload["content"]
         )
