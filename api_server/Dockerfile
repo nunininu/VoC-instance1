@@ -10,4 +10,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-CMD ["sh", "-c", "uvicorn api_server:app --host 0.0.0.0 --port $APP_PORT --reload"]
+COPY wait-for-it.sh /wait-for-it.sh
+RUN chmod +x /wait-for-it.sh
+
+CMD sh -c "/wait-for-it.sh kafka:9093 -t 120 -- uvicorn api_server:app --host 0.0.0.0 --port $APP_PORT --reload"
