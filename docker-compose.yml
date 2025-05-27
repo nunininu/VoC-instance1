@@ -11,6 +11,14 @@ services:
       - ALLOW_ANONYMOUS_LOGIN=yes
     networks:
       - kafka-network
+    healthcheck:
+      test: [
+        "CMD-SHELL",
+        "/opt/bitnami/zookeeper/bin/zkServer.sh status"
+      ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     deploy:
       resources:
         limits:
@@ -31,18 +39,10 @@ services:
       - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
       - KAFKA_CFG_INTER_BROKER_LISTENER_NAME=INTERNAL
     depends_on:
-      - zookeeper
+      zookeeper:
+        condition: service_healthy
     networks:
       - kafka-network
-    healthcheck:
-      test: [
-        "CMD-SHELL",
-        "/opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9093 --list || exit 1"
-      ]
-      interval: 10s
-      timeout: 10s
-      retries: 10
-      start_period: 20s
     deploy:
       resources:
         limits:
@@ -77,11 +77,10 @@ services:
       - APP_PORT=8888
     ports:
       - "8888:8888"
-    depends_on:
-      kafka:
-        condition: service_healthy
     networks:
       - kafka-network
+    depends_on:
+      - kafka
     deploy:
       resources:
         limits:
@@ -99,11 +98,10 @@ services:
       - APP_PORT=8889
     ports:
       - "8889:8889"
-    depends_on:
-      kafka:
-        condition: service_healthy
     networks:
       - kafka-network
+    depends_on:
+      - kafka
     deploy:
       resources:
         limits:
