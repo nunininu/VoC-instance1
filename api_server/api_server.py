@@ -259,11 +259,17 @@ async def get_consultings(
     offset = (page - 1) * limit
 
     if category_id != -1:
-        consulting_query += "AND co.category_id = $3"
-        consulting_query += "ORDER BY co.consulting_datetime DESC\nLIMIT $4 OFFSET $5"
+        consulting_query += """
+            AND co.category_id = $3
+        ORDER BY co.consulting_datetime DESC
+        LIMIT $4 OFFSET $5
+        """
         data.extend([category_id, limit, offset])
     else:
-        consulting_query += "ORDER BY co.consulting_datetime DESC\nLIMIT $3 OFFSET $4"
+        consulting_query += """
+        ORDER BY co.consulting_datetime DESC
+        LIMIT $3 OFFSET $4
+        """
         data.extend([limit, offset])
 
     category, consultings = await asyncio.gather(
@@ -331,12 +337,12 @@ async def get_client_detail_with_id(
     Returns:
         (dict): 고객 상세 내역
     """
-    query_client = """
+    client_query = """
     SELECT client_id, client_name, signup_datetime, is_terminated
     FROM client
     WHERE client_id = $1
     """
-    query_consultings = """
+    consulting_query = """
     SELECT co.consulting_id, ca.category_name, co.consulting_datetime
     FROM consulting as co
     JOIN category as ca ON co.category_id = ca.category_id
@@ -344,19 +350,33 @@ async def get_client_detail_with_id(
     ORDER BY co.consulting_datetime DESC
     LIMIT $2 OFFSET $3
     """
+    sentiment_query = """
+    SELECT ar.client_id, COALESCE(AVG(ar.positive), 0) AS positive, COALESCE(AVG(ar.negative), 0) AS negative
+    FROM analysis_result AS ar
+    JOIN client AS cl ON ar.client_id = cl.client_id
+    WHERE ar.client_id = $1
+    GROUP BY ar.client_id;
+    """
 
     offset = (page - 1) * limit
 
-    client_result, consultings = await asyncio.gather(
-        fetch_query(query_client, (client_id, )),
-        fetch_query(query_consultings, (client_id, limit, offset))
+    client_result, consultings, sentiment = await asyncio.gather(
+        fetch_query(client_query, (client_id, )),
+        fetch_query(consulting_query, (client_id, limit, offset)),
+        fetch_query(sentiment_query, (client_id, ))
     )
 
     if not client_result:
         raise HTTPException(status_code=404, detail="고객을 찾을 수 없습니다.")
 
     client = client_result[0]
+    positive = sentiment[0]["positive"]
+    negative = sentiment[0]["negative"]
+
     client["consultings"] = consultings
+    client["positive"] = positive
+    client["negative"] = negative
+    
     return client
 
 @app.get("/report")
