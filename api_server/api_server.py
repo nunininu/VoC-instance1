@@ -263,11 +263,11 @@ async def get_consulting_detail(consulting_id: str) -> dict:
         (dict): 문의 상세 내역
     """
     query = """
-    SELECT cl.client_id, cl.client_name, ca.category_name, co.consulting_datetime, co.content -- ar.keywords, ar.positive, ar.negative
+        SELECT cl.client_id, cl.client_name, ca.category_name, co.consulting_datetime, co.content, ar.keywords, ar.positive, ar.negative
     FROM consulting as co
     JOIN client as cl ON co.client_id = cl.client_id
     JOIN category as ca ON co.category_id = ca.category_id
-    -- JOIN analysis_result as ar on co.consulting_id = ar.consulting_id
+    JOIN analysis_result as ar on co.consulting_id = ar.consulting_id
     WHERE consulting_id = $1
     """
     result = await fetch_query(query, (consulting_id, ))
