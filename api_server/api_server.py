@@ -351,3 +351,86 @@ async def get_client_detail_with_id(
     client = client_result[0]
     client["consultings"] = consultings
     return client
+
+@app.get("/report")
+async def get_report() -> dict:
+    """
+    문의에 대한 리포트 반환
+    1. 2일 전 ~ 1일 전 / 1일 전 ~ 현재 문의 수 비교
+    2. 2일 전 ~ 1일 전 / 1일 전 ~ 현재 평균 부정률 비교
+    3. 1일 전 ~ 현재 문의 카테고리 Top 5
+    4. 1일 전 ~ 현재 키워드 Top 5
+
+    Returns:
+        (dict): 리포트
+    """
+    now = datetime.now()
+    one_day_ago = now - timedelta(days=1)
+    two_days_ago = now - timedelta(days=2)
+
+    consulting_query = """
+    SELECT
+        COUNT(*) FILTER (
+            WHERE consulting_datetime BETWEEN $1 AND $2
+        ) AS consulting_cnt_yesterday,
+        COUNT(*) FILTER (
+            WHERE consulting_datetime BETWEEN $2 AND $3
+        ) AS consulting_cnt_today
+    FROM consulting;
+    """
+    avg_negative_query = """
+    SELECT
+        COALESCE(
+            AVG(ar.negative) FILTER (
+                WHERE co.consulting_datetime BETWEEN $1 AND $2
+            ), 0
+        ) AS avg_negative_yesterday,
+        COALESCE(
+            AVG(ar.negative) FILTER (
+                WHERE co.consulting_datetime BETWEEN $2 AND $3
+            ), 0
+        ) AS avg_negative_today
+    FROM analysis_result AS ar
+    JOIN consulting AS co ON ar.consulting_id = co.consulting_id;
+    """
+    category_query = """
+    SELECT
+        RANK() OVER (ORDER BY COUNT(*) DESC) AS rank,
+        ca.category_name AS category_name,
+        COUNT(*) AS cnt
+    FROM consulting AS co
+    JOIN category AS ca ON co.category_id = ca.category_id
+    WHERE co.consulting_datetime BETWEEN $1 AND $2
+    GROUP BY ca.category_name
+    ORDER BY rank
+    LIMIT 5;
+    """
+    keywords_query = """
+    SELECT
+        RANK() OVER (ORDER BY COUNT(*) DESC) AS rank,
+        keyword,
+        COUNT(*) AS cnt
+    FROM (
+        SELECT TRIM(unnest(string_to_array(ar.keywords, ','))) AS keyword, co.consulting_datetime
+        FROM analysis_result AS ar
+        JOIN consulting AS co ON ar.consulting_id = co.consulting_id
+    ) AS keyword_table
+    WHERE consulting_datetime BETWEEN $1 AND $2
+    GROUP BY keyword
+    ORDER BY rank
+    LIMIT 5;
+    """
+
+    results = await asyncio.gather(
+        fetch_query(consulting_query, (two_days_ago, one_day_ago, now)),
+        fetch_query(avg_negative_query, (two_days_ago, one_day_ago, now)),
+        fetch_query(category_query, (one_day_ago, now)),
+        fetch_query(keywords_query, (one_day_ago, now))
+    )
+
+    return {
+        "consulting_cnt": results[0][0],
+        "avg_negative": results[1][0],
+        "top_categories": results[2],
+        "top_keywords": results[3]
+    }
