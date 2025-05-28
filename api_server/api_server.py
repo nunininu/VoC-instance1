@@ -2,8 +2,8 @@ import asyncio
 import logging
 import json
 import os
-from datetime import datetime
-from typing import Optional, Tuple, List
+from datetime import datetime, date, timedelta
+from typing import Optional, Tuple, List, Dict, Any
 from contextlib import asynccontextmanager
 
 import asyncpg
@@ -227,29 +227,49 @@ async def submit_data(json_file: bytes = File(...)) -> Response:
 
 @app.get("/consultings")
 async def get_consultings(
+    category_id: int = -1,
+    start_date: date = Query(default_factory=lambda: date.today() - timedelta(days=30)),
+    end_date: date = Query(default_factory=date.today),
     page: int = Query(1, gt=0),
     limit: int = Query(20, gt=0)
-) -> List[dict]:
+) -> Dict[str, Any]:
     """
     문의 내역 전체 최신순으로 가져온 후 반환
 
     Args:  
+        category_id (int): 카테고리, 기본값은 전체  
+        start_date (date): 조회 시작 일자, 기본값은 최근 30일  
+        end_date (date): 조회 종료 일자, 기본값은 금일  
         page (int): 페이지  
         limit (int): 페이지 당 문의 수
 
     Returns:  
-        (List[dict]): 문의 내역 리스트
+        (Dict[str, Any]): 카테고리 및 문의 내역 리스트
     """
+    category_query = "SELECT * FROM category"
+    categories = await fetch_query(category_query)
+    category_map = {a["category_name"]: a["category_id"] for a in categories}
+    category_map["전체"] = -1
+
+    data = [start_date, end_date]
     offset = (page - 1) * limit
     query = """
     SELECT co.consulting_id, cl.client_name, cl.client_id, ca.category_name, co.consulting_datetime
     FROM consulting as co
     JOIN client as cl ON co.client_id = cl.client_id
     JOIN category as ca ON co.category_id = ca.category_id
-    ORDER BY co.consulting_datetime DESC
-    LIMIT $1 OFFSET $2
+    WHERE co.consulting_datetime BETWEEN $1 AND $2
     """
-    return await fetch_query(query, (limit, offset))
+    if category_id != -1:
+        query += "AND co.category_id = $3"
+        query += "ORDER BY co.consulting_datetime DESC\nLIMIT $4 OFFSET $5"
+        data.extend([category_id, limit, offset])
+    else:
+        query += "ORDER BY co.consulting_datetime DESC\nLIMIT $3 OFFSET $4"
+        data.extend([limit, offset])
+    consultings = await fetch_query(query, tuple(data))
+    
+    return {"category": category_map, "consultings": consultings}
 
 @app.get("/consulting/{consulting_id}")
 async def get_consulting_detail(consulting_id: str) -> dict:
@@ -268,7 +288,7 @@ async def get_consulting_detail(consulting_id: str) -> dict:
     JOIN client as cl ON co.client_id = cl.client_id
     JOIN category as ca ON co.category_id = ca.category_id
     JOIN analysis_result as ar on co.consulting_id = ar.consulting_id
-    WHERE consulting_id = $1
+    WHERE co.consulting_id = $1
     """
     result = await fetch_query(query, (consulting_id, ))
     return result[0] if result else {}
