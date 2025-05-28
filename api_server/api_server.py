@@ -241,35 +241,42 @@ async def get_consultings(
         start_date (date): 조회 시작 일자, 기본값은 최근 30일  
         end_date (date): 조회 종료 일자, 기본값은 금일  
         page (int): 페이지  
-        limit (int): 페이지 당 문의 수
+        limit (int): 페이지 당 문의 수  
 
     Returns:  
-        (Dict[str, Any]): 카테고리 및 문의 내역 리스트
+        (Dict[str, Any]): 카테고리 목록 및 문의 내역 리스트
     """
     category_query = "SELECT * FROM category"
-    categories = await fetch_query(category_query)
-    category_map = {a["category_name"]: a["category_id"] for a in categories}
-    category_map["전체"] = -1
-
-    data = [start_date, end_date]
-    offset = (page - 1) * limit
-    query = """
+    consulting_query = """
     SELECT co.consulting_id, cl.client_name, cl.client_id, ca.category_name, co.consulting_datetime
     FROM consulting as co
     JOIN client as cl ON co.client_id = cl.client_id
     JOIN category as ca ON co.category_id = ca.category_id
     WHERE co.consulting_datetime BETWEEN $1 AND $2
     """
+
+    data = [start_date, end_date]
+    offset = (page - 1) * limit
+
     if category_id != -1:
-        query += "AND co.category_id = $3"
-        query += "ORDER BY co.consulting_datetime DESC\nLIMIT $4 OFFSET $5"
+        consulting_query += "AND co.category_id = $3"
+        consulting_query += "ORDER BY co.consulting_datetime DESC\nLIMIT $4 OFFSET $5"
         data.extend([category_id, limit, offset])
     else:
-        query += "ORDER BY co.consulting_datetime DESC\nLIMIT $3 OFFSET $4"
+        consulting_query += "ORDER BY co.consulting_datetime DESC\nLIMIT $3 OFFSET $4"
         data.extend([limit, offset])
-    consultings = await fetch_query(query, tuple(data))
-    
-    return {"category": category_map, "consultings": consultings}
+
+    category, consultings = await asyncio.gather(
+        fetch_query(category_query),
+        fetch_query(consulting_query, tuple(data))
+    )
+    category_map = {c["category_name"]: c["category_id"] for c in category}
+    category_map["전체"] = -1
+
+    return {
+        "category": category_map,
+        "consultings": consultings
+    }
 
 @app.get("/consulting/{consulting_id}")
 async def get_consulting_detail(consulting_id: str) -> dict:
