@@ -316,24 +316,19 @@ async def get_client_detail_with_id(
     """
     입력 또는 이름 검색에서 선택한 고객 ID로 고객 상세 내역 반환
 
-    Args:  
-        client_id (str): 고객 고유 ID  
-        page (int): 고객 최근 문의 내역 페이지  
+    Args:
+        client_id (str): 고객 고유 ID
+        page (int): 고객 최근 문의 내역 페이지
         limit (int): 페이지 당 고객 최근 문의 내역
 
-    Returns:  
+    Returns:
         (dict): 고객 상세 내역
     """
-    offset = (page - 1) * limit
     query_client = """
     SELECT client_id, client_name, signup_datetime, is_terminated
     FROM client
     WHERE client_id = $1
     """
-    client_result = await fetch_query(query_client, (client_id, ))
-    if not client_result:
-        raise HTTPException(status_code=404, detail="고객을 찾을 수 없습니다.")
-
     query_consultings = """
     SELECT co.consulting_id, ca.category_name, co.consulting_datetime
     FROM consulting as co
@@ -342,7 +337,17 @@ async def get_client_detail_with_id(
     ORDER BY co.consulting_datetime DESC
     LIMIT $2 OFFSET $3
     """
-    consultings = await fetch_query(query_consultings, (client_id, limit, offset))
+
+    offset = (page - 1) * limit
+
+    client_result, consultings = await asyncio.gather(
+        fetch_query(query_client, (client_id, )),
+        fetch_query(query_consultings, (client_id, limit, offset))
+    )
+
+    if not client_result:
+        raise HTTPException(status_code=404, detail="고객을 찾을 수 없습니다.")
+
     client = client_result[0]
     client["consultings"] = consultings
     return client
