@@ -206,7 +206,7 @@ async def submit_data(json_file: bytes = File(...)) -> Response:
     """
     try:
         payload = json.loads(json_file.decode("utf-8"))
-        logger.info(f"데이터 수신 완료. payload keys={list(payload.keys())}")
+        logger.info(f"데이터 수신 완료. payload={payload}")
 
         # DB 저장
         insert_sql = """
@@ -304,6 +304,7 @@ async def get_consulting_detail(consulting_id: str) -> dict:
     WHERE co.consulting_id = $1
     """
     result = await fetch_query(query, (consulting_id, ))
+    logger.info(f"결과 -> {result}")
     return result[0] if result else {}
 
 @app.get("/client")
