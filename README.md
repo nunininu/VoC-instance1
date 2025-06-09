@@ -1,9 +1,10 @@
-# 멀티1 Repo
-### 1. for API
-```bash
+# Instance-1 Repository
 
-```
-
+## 구성
+- Docker compose
+- API server
+- nginx
+- Kafka(zookeeper, broker)
 
 
 # 참고: 본진 Repo Wiki 
