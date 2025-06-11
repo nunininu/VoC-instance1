@@ -400,18 +400,16 @@ async def get_report() -> dict:
         ) AS consulting_cnt_today
     FROM consulting;
     """
-    avg_negative_query = """
+    negative_query = """
     SELECT
-        COALESCE(
-            AVG(ar.negative) FILTER (
-                WHERE co.consulting_datetime BETWEEN $1 AND $2
-            ), 0
-        ) AS avg_negative_yesterday,
-        COALESCE(
-            AVG(ar.negative) FILTER (
-                WHERE co.consulting_datetime BETWEEN $2 AND $3
-            ), 0
-        ) AS avg_negative_today
+        COUNT(*) FILTER (
+            WHERE co.consulting_datetime BETWEEN $1 AND $2
+              AND ar.is_negative = TRUE
+        ) AS negative_cnt_yesterday,
+        COUNT(*) FILTER (
+            WHERE consulting_datetime BETWEEN $2 AND $3
+              AND ar.is_negative = TRUE
+        ) AS negative_cnt_today
     FROM analysis_result AS ar
     JOIN consulting AS co ON ar.consulting_id = co.consulting_id;
     """
@@ -445,14 +443,14 @@ async def get_report() -> dict:
 
     results = await asyncio.gather(
         fetch_query(consulting_query, (two_days_ago, one_day_ago, now)),
-        fetch_query(avg_negative_query, (two_days_ago, one_day_ago, now)),
+        fetch_query(negative_query, (two_days_ago, one_day_ago, now)),
         fetch_query(category_query, (one_day_ago, now)),
         fetch_query(keywords_query, (one_day_ago, now))
     )
 
     return {
         "consulting_cnt": results[0][0],
-        "avg_negative": results[1][0],
+        "negative_cnt": results[1][0],
         "top_categories": results[2],
         "top_keywords": results[3]
     }
