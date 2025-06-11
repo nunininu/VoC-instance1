@@ -358,33 +358,20 @@ async def get_client_detail_with_id(
     ORDER BY co.consulting_datetime DESC
     LIMIT $2 OFFSET $3
     """
-    sentiment_query = """
-    SELECT ar.client_id, COALESCE(AVG(ar.positive), 0) AS positive, COALESCE(AVG(ar.negative), 0) AS negative
-    FROM analysis_result AS ar
-    JOIN client AS cl ON ar.client_id = cl.client_id
-    WHERE ar.client_id = $1
-    GROUP BY ar.client_id;
-    """
 
     offset = (page - 1) * limit
 
-    client_result, consultings, sentiment = await asyncio.gather(
+    client_result, consultings = await asyncio.gather(
         fetch_query(client_query, (client_id, )),
-        fetch_query(consulting_query, (client_id, limit, offset)),
-        fetch_query(sentiment_query, (client_id, ))
+        fetch_query(consulting_query, (client_id, limit, offset))
     )
 
     if not client_result:
         raise HTTPException(status_code=404, detail="고객을 찾을 수 없습니다.")
 
     client = client_result[0]
-    positive = sentiment[0]["positive"]
-    negative = sentiment[0]["negative"]
-
     client["consultings"] = consultings
-    client["positive"] = positive
-    client["negative"] = negative
-    
+
     return client
 
 @app.get("/report")
