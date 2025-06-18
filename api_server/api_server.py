@@ -22,6 +22,7 @@ DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB = (
 )
 BOOTSTRAP_SERVER    = "kafka:9093"
 TOPIC               = "voc-consulting-raw"
+DLQ_TOPIC           = "voc-dlq"
 MAX_RETRIES         = 3
 
 # ------ 공통 클라이언트 -----
@@ -40,25 +41,31 @@ def create_kafka_topic():
     """
     Kafka 토픽 생성
     """
-    try:
-        admin = KafkaAdminClient(
-            bootstrap_servers=BOOTSTRAP_SERVER,
-            client_id="api-server"
-        )
-        admin.create_topics(
-            [NewTopic(name=TOPIC, num_partitions=3, replication_factor=1)]
-        )
-        logger.info(f"토픽 생성 완료: {TOPIC}")
-    except TopicAlreadyExistsError:
-        logger.warning(f"이미 존재하는 토픽: {TOPIC}")
-    finally:
-        admin.close()
+    admin = KafkaAdminClient(
+        bootstrap_servers=BOOTSTRAP_SERVER,
+        client_id="api-server"
+    )
+    topics = [TOPIC, DLQ_TOPIC]
+
+    for topic in topics:
+        try:
+            admin.create_topics(
+                new_topics=[NewTopic(name=topic, num_partitions=3, replication_factor=1)],
+                validate_only=False
+            )
+            logger.info(f"토픽 생성 완료: {topic}")
+        except TopicAlreadyExistsError:
+            logger.warning(f"이미 존재하는 토픽: {topic}")
+        except Exception as e:
+            logger.error(f"토핑 생성 실패: {topic} - {e}")
+
+    admin.close()
 
 async def safe_send_kafka(msg: dict):
     """
     Kafka Broker로 메시지 전송
 
-    Args:  
+    Args:
         msg (dict): 문의 정보가 담긴 데이터
     """
     for attempt in range(MAX_RETRIES):
@@ -79,11 +86,11 @@ async def fetch_query(
     """
     SELECT 쿼리 결과를 JSON serializable 형태로 반환
 
-    Args:  
-        query (str): SELECT 쿼리  
+    Args:
+        query (str): SELECT 쿼리
         data (Optional[Tuple]): 파라미터 값. 기본은 None
 
-    Returns:  
+    Returns:
         list[dict]: 결과 rows
     """
     async with db_pool.acquire() as conn:
@@ -93,27 +100,46 @@ async def fetch_query(
 async def execute_query_with_rollback(
         query: str,
         kafka_msg: dict = None,
-        data: Optional[Tuple] = None):
+        data: Optional[Tuple] = None,
+        conn=None):
     """
     INSERT, DELETE, UPDATE 쿼리 실행
 
-    Args:  
-        query (str): SQL 쿼리문  
-        kafka_msg (dict): Kafka Broker에 전달할 메시지  
+    Args:
+        query (str): SQL 쿼리문
+        kafka_msg (dict): Kafka Broker에 전달할 메시지
         data (Optional[Tuple]): 쿼리에 필요한 데이터 (기본 값은 None)
+        conn (): 외부에서 넘긴 DB connection, 기본 값은 None
     """
+    own_conn = False
+    if conn is None:
+        own_conn = True
+        conn = await db_pool.acquire()
+        
     try:
-        async with db_pool.acquire() as conn:
-            async with conn.transaction():
-                await conn.execute(query, *data) if data else conn.execute(query)
-                logger.info("쿼리 실행 성공!")
+        tx = None
+        if own_conn:
+            tx = conn.transaction()
+            await tx.start()
+        
+        await conn.execute(query, *data) if data else await conn.execute(query)
+        logger.info("쿼리 실행 성공!")
 
-                if kafka_msg:
-                    await safe_send_kafka(kafka_msg)
-                    logger.info("Kafka 전송 성공!")
+        if kafka_msg:
+            await safe_send_kafka(kafka_msg)
+            logger.info("Kafka 전송 성공!")
+        
+        if own_conn:
+            await tx.commit()
+
     except Exception as e:
         logger.error(f"DB/Kafka 처리 실패: {e}")
+        if own_conn and tx:
+            await tx.rollback()
         raise
+    finally:
+        if own_conn:
+            await db_pool.release(conn)
 
 # ----- Life cycle -----
 async def init_database():
@@ -129,14 +155,14 @@ async def init_database():
         database=DB
     )
     logger.info("DB 연결 성공!")
-    
+
 async def init_kafka_producer():
     """
     Kafka Producer 생성
     """
     global producer
     retries = 20
-    
+
     for attempt in range(retries):
         try:
             producer = AIOKafkaProducer(
@@ -155,7 +181,7 @@ async def init_kafka_producer():
     else:
         logger.error("Kafka 연결 실패. 종료되지 않지만 연결은 실패 상태.")
         producer = None
-        
+
 async def close_server():
     """
     서버 종료 시 실행
@@ -168,15 +194,15 @@ async def close_server():
     finally:
         await producer.stop()
         await db_pool.close()
-    
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    FastAPI Lifecycle 관리  
-    yield 이전 코드는 서버 시작 직후 실행되고,  
+    FastAPI Lifecycle 관리
+    yield 이전 코드는 서버 시작 직후 실행되고,
     yield 이후 코드는 서버 종료 직후 실행된다.
 
-    Args:  
+    Args:
         app (FastAPI): 실행 시킬 FastAPI 앱
     """
     await init_database()
@@ -198,31 +224,44 @@ async def submit_data(json_file: bytes = File(...)) -> Response:
     """
     문의 데이터를 받아 DB 저장 및 Kakfa 메시지 전송
 
-    Args:  
+    Args:
         json_file (bytes): 문의 정보가 담긴 json 파일
 
-    Returns:  
+    Returns:
         (Response): 요청 결과
     """
     try:
         payload = json.loads(json_file.decode("utf-8"))
         logger.info(f"데이터 수신 완료. payload={payload}")
-
-        # DB 저장
-        insert_sql = """
-        INSERT INTO consulting (consulting_id, client_id, category_id, channel_id, consulting_datetime, turns, content)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-        """
-        data = (
-            payload["consulting_id"], payload["client_id"], payload["category_id"],
-            payload["channel_id"], datetime.strptime(payload["consulting_datetime"], "%Y-%m-%dT%H:%M:%S"),
-            payload["turns"], payload["content"]
-        )
-        await execute_query_with_rollback(insert_sql, payload, data)
-        logger.info("문의 데이터 저장 성공")
+        
+        async with db_pool.acquire() as conn:
+            async with conn.transaction():
+                # 문의 내역 INSERT
+                insert_sql = """
+                INSERT INTO consulting (consulting_id, client_id, category_id, channel_id, consulting_datetime, turns, content)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                """
+                data_insert = (
+                    payload["consulting_id"], payload["client_id"], payload["category_id"],
+                    payload["channel_id"], datetime.strptime(payload["consulting_datetime"], "%Y-%m-%dT%H:%M:%S"),
+                    payload["turns"], payload["content"]
+                )
+                await execute_query_with_rollback(insert_sql, payload, data_insert, conn)
+                
+                # 고객 정보 UPDATE
+                update_sql = """
+                UPDATE client SET latest_consulting_datetime = $1 WHERE client_id = $2
+                """
+                data_update = (
+                    datetime.now(),
+                    payload["client_id"]
+                )
+                await execute_query_with_rollback(update_sql, None, data_update, conn)
+                
+        logger.info("문의 데이터 저장 + 고객 정보 업데이트 성공")
         return Response(status_code=204)
     except Exception as e:
-        logger.exception(f"문의 데이터 저장 중 에러 발생: {e}")
+        logger.exception(f"문의 데이터 저장 또는 고객 정보 업데이트 중 에러 발생: {e}")
         raise HTTPException(status_code=500, detail="처리 실패")
 
 @app.get("/consultings")
@@ -236,14 +275,14 @@ async def get_consultings(
     """
     문의 내역 전체 최신순으로 가져온 후 반환
 
-    Args:  
-        category_id (int): 카테고리, 기본값은 전체  
-        start_date (date): 조회 시작 일자, 기본값은 최근 30일  
-        end_date (date): 조회 종료 일자, 기본값은 금일  
-        page (int): 페이지  
-        limit (int): 페이지 당 문의 수  
+    Args:
+        category_id (int): 카테고리, 기본값은 전체
+        start_date (date): 조회 시작 일자, 기본값은 최근 30일
+        end_date (date): 조회 종료 일자, 기본값은 금일
+        page (int): 페이지
+        limit (int): 페이지 당 문의 수
 
-    Returns:  
+    Returns:
         (Dict[str, Any]): 카테고리 목록 및 문의 내역 리스트
     """
     category_query = "SELECT * FROM category"
@@ -289,18 +328,25 @@ async def get_consulting_detail(consulting_id: str) -> dict:
     """
     문의 내역 상세 반환
 
-    Args:  
+    Args:
         consulting_id (str): 문의 고유 ID
 
-    Returns:  
+    Returns:
         (dict): 문의 상세 내역
     """
     query = """
-        SELECT cl.client_id, cl.client_name, ca.category_name, co.consulting_datetime, co.content, ar.keywords, ar.positive, ar.negative
+    SELECT cl.client_id, cl.client_name, ca.category_name, co.consulting_datetime, co.content, ar.keywords, ar.is_negative, ar.negative_point
     FROM consulting as co
     JOIN client as cl ON co.client_id = cl.client_id
     JOIN category as ca ON co.category_id = ca.category_id
-    JOIN analysis_result as ar on co.consulting_id = ar.consulting_id
+    LEFT JOIN LATERAL (
+        SELECT ar.keywords, ar.is_negative, ar.negative_point
+        FROM analysis_result ar
+        WHERE ar.consulting_id = co.consulting_id
+          AND co.analysis_status = 'SUCCESSED'
+        ORDER BY ar.created_datetime DESC
+        LIMIT 1
+    ) ar ON true
     WHERE co.consulting_id = $1
     """
     result = await fetch_query(query, (consulting_id, ))
@@ -312,10 +358,10 @@ async def get_client_with_name(client_name: str) -> List[dict]:
     """
     입력한 이름과 동일한 고객 리스트 반환
 
-    Args:  
+    Args:
         client_name (str): 고객 이름
 
-    Returns:  
+    Returns:
         (List[dict]): 동명이인 고객 리스트
     """
     query = "SELECT * FROM client WHERE client_name = $1"
@@ -339,7 +385,7 @@ async def get_client_detail_with_id(
         (dict): 고객 상세 내역
     """
     client_query = """
-    SELECT client_id, client_name, signup_datetime, is_terminated
+    SELECT client_id, client_name, age, gender, signup_datetime, is_terminated
     FROM client
     WHERE client_id = $1
     """
@@ -351,33 +397,20 @@ async def get_client_detail_with_id(
     ORDER BY co.consulting_datetime DESC
     LIMIT $2 OFFSET $3
     """
-    sentiment_query = """
-    SELECT ar.client_id, COALESCE(AVG(ar.positive), 0) AS positive, COALESCE(AVG(ar.negative), 0) AS negative
-    FROM analysis_result AS ar
-    JOIN client AS cl ON ar.client_id = cl.client_id
-    WHERE ar.client_id = $1
-    GROUP BY ar.client_id;
-    """
 
     offset = (page - 1) * limit
 
-    client_result, consultings, sentiment = await asyncio.gather(
+    client_result, consultings = await asyncio.gather(
         fetch_query(client_query, (client_id, )),
-        fetch_query(consulting_query, (client_id, limit, offset)),
-        fetch_query(sentiment_query, (client_id, ))
+        fetch_query(consulting_query, (client_id, limit, offset))
     )
 
     if not client_result:
         raise HTTPException(status_code=404, detail="고객을 찾을 수 없습니다.")
 
     client = client_result[0]
-    positive = sentiment[0]["positive"]
-    negative = sentiment[0]["negative"]
-
     client["consultings"] = consultings
-    client["positive"] = positive
-    client["negative"] = negative
-    
+
     return client
 
 @app.get("/report")
@@ -406,18 +439,16 @@ async def get_report() -> dict:
         ) AS consulting_cnt_today
     FROM consulting;
     """
-    avg_negative_query = """
+    negative_query = """
     SELECT
-        COALESCE(
-            AVG(ar.negative) FILTER (
-                WHERE co.consulting_datetime BETWEEN $1 AND $2
-            ), 0
-        ) AS avg_negative_yesterday,
-        COALESCE(
-            AVG(ar.negative) FILTER (
-                WHERE co.consulting_datetime BETWEEN $2 AND $3
-            ), 0
-        ) AS avg_negative_today
+        COUNT(*) FILTER (
+            WHERE co.consulting_datetime BETWEEN $1 AND $2
+              AND ar.is_negative = TRUE
+        ) AS negative_cnt_yesterday,
+        COUNT(*) FILTER (
+            WHERE consulting_datetime BETWEEN $2 AND $3
+              AND ar.is_negative = TRUE
+        ) AS negative_cnt_today
     FROM analysis_result AS ar
     JOIN consulting AS co ON ar.consulting_id = co.consulting_id;
     """
@@ -451,14 +482,14 @@ async def get_report() -> dict:
 
     results = await asyncio.gather(
         fetch_query(consulting_query, (two_days_ago, one_day_ago, now)),
-        fetch_query(avg_negative_query, (two_days_ago, one_day_ago, now)),
+        fetch_query(negative_query, (two_days_ago, one_day_ago, now)),
         fetch_query(category_query, (one_day_ago, now)),
         fetch_query(keywords_query, (one_day_ago, now))
     )
 
     return {
         "consulting_cnt": results[0][0],
-        "avg_negative": results[1][0],
+        "negative_cnt": results[1][0],
         "top_categories": results[2],
         "top_keywords": results[3]
     }
